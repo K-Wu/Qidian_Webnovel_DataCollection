@@ -231,8 +231,18 @@ class QidianScraper:
             "X-Requested-With": "XMLHttpRequest",
         }
 
-    def _make_request(self, url, params, referer, bookId, retry=True):
-        """发起API请求，自动处理Token过期"""
+    def _check_waf_block(self, resp):
+        """检查是否被WAF拦截"""
+        if resp.status_code == 202:
+            return True
+        if 'WAF' in resp.text or '请求已中断' in resp.text or '腾讯云' in resp.text:
+            return True
+        if 'x-waf-captcha' in resp.text.lower():
+            return True
+        return False
+
+    def _make_request(self, url, params, referer, bookId, retry=True, retry_count=0):
+        """发起API请求，自动处理Token过期和WAF拦截"""
         headers = self._get_api_headers(referer)
 
         # 添加token到参数
@@ -241,15 +251,29 @@ class QidianScraper:
         if self.w_tsfp:
             params['w_tsfp'] = self.w_tsfp
 
+        # 添加随机延迟，避免请求过快
+        time.sleep(0.5 + np.random.random() * 0.5)
+
         try:
             resp = self.session.get(url, params=params, headers=headers, timeout=15)
-            resp.encoding = 'utf-8'  # 强制使用UTF-8编码
+            resp.encoding = 'utf-8'
 
             self._debug_print(f"响应状态: {resp.status_code}, 长度: {len(resp.text)}")
 
-            if not resp.text or resp.status_code == 202:
+            # 检查WAF拦截
+            if self._check_waf_block(resp):
+                if retry_count < 3:
+                    wait_time = 30 * (retry_count + 1)  # 30秒、60秒、90秒递增
+                    print(f"\n  检测到WAF拦截，等待 {wait_time} 秒后重试...", flush=True)
+                    time.sleep(wait_time)
+                    # 刷新Token
+                    if self.refresh_tokens(bookId):
+                        return self._make_request(url, params, referer, bookId, retry=True, retry_count=retry_count+1)
+                return None
+
+            if not resp.text:
                 if retry:
-                    self._debug_print("响应为空或被拦截，尝试刷新Token...")
+                    self._debug_print("响应为空，尝试刷新Token...")
                     if self.refresh_tokens(bookId):
                         return self._make_request(url, params, referer, bookId, retry=False)
                 return None
@@ -267,9 +291,12 @@ class QidianScraper:
 
         except json.JSONDecodeError as e:
             self._debug_print(f"JSON解析错误: {e}")
-            if retry:
+            # 可能是WAF返回的HTML页面
+            if retry and retry_count < 2:
+                print(f"\n  可能被WAF拦截，等待 30 秒后重试...", flush=True)
+                time.sleep(30)
                 if self.refresh_tokens(bookId):
-                    return self._make_request(url, params, referer, bookId, retry=False)
+                    return self._make_request(url, params, referer, bookId, retry=True, retry_count=retry_count+1)
             return None
         except Exception as e:
             self._debug_print(f"请求出错: {e}")
@@ -542,7 +569,8 @@ def scrape_book_reviews(bookId, output_dir=None, debug=False):
                     comment['originalText'] = original_text  # 添加原文
                     chapter_reviews.append(comment)
 
-                time.sleep(0.3)
+                # 段落间随机延迟 0.5-1.5秒
+                time.sleep(0.5 + np.random.random())
 
             # 保存章节文件
             if chapter_reviews:
@@ -556,11 +584,14 @@ def scrape_book_reviews(bookId, output_dir=None, debug=False):
                 empty_df = pd.DataFrame()
                 empty_df.to_csv(os.path.join(chapters_dir, f"{chapterId}.csv"), index=False, encoding='utf-8-sig')
 
-            time.sleep(0.5)
+            # 章节间随机延迟 2-4秒，避免触发WAF
+            delay = 2 + np.random.random() * 2
+            print(f"  等待 {delay:.1f} 秒后继续...")
+            time.sleep(delay)
 
         except ConnectionError as e:
-            print(f"  连接错误: {e}，等待30秒后继续...")
-            time.sleep(30)
+            print(f"  连接错误: {e}，等待60秒后继续...")
+            time.sleep(60)
             scraper.refresh_tokens(bookId)
         except Exception as e:
             print(f"  处理出错: {e}")
