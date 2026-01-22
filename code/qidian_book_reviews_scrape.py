@@ -56,123 +56,159 @@ class QidianScraper:
         if self.debug:
             print(f"  [DEBUG] {msg}")
 
-    def init_tokens_via_browser(self, bookId):
-        """
-        打开浏览器窗口让用户操作，完成验证后获取Cookie
-        """
-        if not SELENIUM_AVAILABLE:
-            print("错误: 需要安装selenium才能使用浏览器模式")
-            print("请运行: pip install selenium")
+    def _create_driver(self, headless=True):
+        """创建浏览器驱动"""
+        chrome_options = Options()
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
+        chrome_options.add_argument("--log-level=3")
+        chrome_options.add_argument("--disable-infobars")
+
+        if headless:
+            chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--window-size=1920,1080")
+        else:
+            chrome_options.add_argument("--start-maximized")
+
+        driver = webdriver.Chrome(options=chrome_options)
+
+        # 隐藏webdriver特征
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            """
+        })
+        return driver
+
+    def _close_driver(self, driver):
+        """安全关闭浏览器"""
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
+
+    def _check_captcha(self, driver):
+        """检查是否遇到验证码"""
+        try:
+            title = driver.title
+            url = driver.current_url
+            cookies = {c['name']: c['value'] for c in driver.get_cookies()}
+
+            # 检查是否有验证码
+            if "验证" in title or "安全" in title:
+                return True
+            # 检查是否被WAF拦截
+            if 'x-waf-captcha-referer' in cookies and '_csrfToken' not in cookies:
+                return True
+            return False
+        except:
             return False
 
-        print("正在启动浏览器...")
-        print("=" * 50)
-        print("请在浏览器中完成以下操作：")
-        print("1. 如果出现验证码，请完成验证")
-        print("2. 等待页面正常加载完成")
-        print("3. 脚本会自动检测并关闭浏览器")
-        print("=" * 50)
-
-        driver = None
-        success = False
+    def _extract_tokens(self, driver):
+        """从浏览器提取Token"""
         try:
-            # 配置Chrome选项
-            chrome_options = Options()
-            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
-            chrome_options.add_argument("--disable-infobars")
-            chrome_options.add_argument("--start-maximized")
-            # 禁用日志输出
-            chrome_options.add_argument("--log-level=3")
-            chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+            cookies = {c['name']: c['value'] for c in driver.get_cookies()}
+            if '_csrfToken' in cookies:
+                self.csrf_token = cookies['_csrfToken']
+                self.w_tsfp = cookies.get('w_tsfp', '')
+                self.cookies = cookies
+                for name, value in cookies.items():
+                    self.session.cookies.set(name, value)
+                return True
+        except:
+            pass
+        return False
 
-            # 启动浏览器
-            driver = webdriver.Chrome(options=chrome_options)
+    def init_tokens_via_browser(self, bookId):
+        """
+        获取Token，默认使用无头模式，遇到验证码时才显示浏览器
+        """
+        if not SELENIUM_AVAILABLE:
+            print("错误: 需要安装selenium，请运行: pip install selenium")
+            return False
 
-            # 执行CDP命令隐藏webdriver特征
-            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-                "source": """
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    })
-                """
-            })
+        book_url = f"https://www.qidian.com/book/{bookId}/"
 
-            # 访问书籍页面
-            book_url = f"https://www.qidian.com/book/{bookId}/"
-            print(f"\n正在访问: {book_url}")
+        # 第一步：尝试无头模式
+        print("正在获取Token（后台模式）...", flush=True)
+        driver = None
+        try:
+            driver = self._create_driver(headless=True)
+            driver.get(book_url)
+            time.sleep(3)  # 等待页面加载
+
+            # 检查是否成功
+            if self._extract_tokens(driver):
+                print(f"成功获取Token: {self.csrf_token[:16]}...", flush=True)
+                self._close_driver(driver)
+                return True
+
+            # 检查是否遇到验证码
+            need_captcha = self._check_captcha(driver)
+            self._close_driver(driver)
+            driver = None
+
+            if not need_captcha:
+                # 再等一下重试
+                print("等待重试...", flush=True)
+                time.sleep(2)
+                driver = self._create_driver(headless=True)
+                driver.get(book_url)
+                time.sleep(5)
+                if self._extract_tokens(driver):
+                    print(f"成功获取Token: {self.csrf_token[:16]}...", flush=True)
+                    self._close_driver(driver)
+                    return True
+                need_captcha = self._check_captcha(driver)
+                self._close_driver(driver)
+                driver = None
+
+        except Exception as e:
+            self._debug_print(f"无头模式出错: {e}")
+            self._close_driver(driver)
+            driver = None
+            need_captcha = True
+
+        # 第二步：需要验证码，打开可见浏览器
+        print("\n" + "=" * 50)
+        print("检测到需要验证，正在打开浏览器...")
+        print("请在浏览器中完成验证码验证")
+        print("完成后脚本会自动继续")
+        print("=" * 50 + "\n", flush=True)
+
+        try:
+            driver = self._create_driver(headless=False)
             driver.get(book_url)
 
-            # 等待页面加载，检测是否成功获取到_csrfToken
-            print("等待页面加载和Cookie生成...")
             max_wait = 120
             start_time = time.time()
 
             while time.time() - start_time < max_wait:
-                try:
-                    # 获取当前cookies
-                    selenium_cookies = driver.get_cookies()
-                    cookie_dict = {c['name']: c['value'] for c in selenium_cookies}
+                if self._extract_tokens(driver):
+                    print(f"\n成功获取Token: {self.csrf_token[:16]}...", flush=True)
+                    self._close_driver(driver)
+                    return True
 
-                    self._debug_print(f"当前cookies: {list(cookie_dict.keys())}")
-
-                    # 检查是否有_csrfToken
-                    if '_csrfToken' in cookie_dict:
-                        self.csrf_token = cookie_dict['_csrfToken']
-                        self.w_tsfp = cookie_dict.get('w_tsfp', '')
-                        self.cookies = cookie_dict
-
-                        # 将cookies设置到requests session
-                        for name, value in cookie_dict.items():
-                            self.session.cookies.set(name, value)
-
-                        print(f"\n成功获取Token!")
-                        print(f"  _csrfToken: {self.csrf_token[:20]}...")
-                        if self.w_tsfp:
-                            print(f"  w_tsfp: {self.w_tsfp[:30]}...")
-
-                        success = True
-                        break
-
-                    # 检查页面标题
-                    title = driver.title
-                    if "验证" in title or "安全" in title:
-                        print(f"\r检测到验证页面，请完成验证... (已等待 {int(time.time() - start_time)}秒)", end="", flush=True)
-                    else:
-                        print(f"\r等待Cookie生成... (已等待 {int(time.time() - start_time)}秒)", end="", flush=True)
-                except Exception as e:
-                    self._debug_print(f"检查cookie时出错: {e}")
-
+                elapsed = int(time.time() - start_time)
+                print(f"\r等待验证完成... ({elapsed}秒)", end="", flush=True)
                 time.sleep(2)
 
-            if not success:
-                print("\n\n超时：未能在规定时间内获取到Cookie")
-                print("请确保页面已正常加载，并刷新重试")
+            print("\n超时：未能获取Token")
 
         except Exception as e:
-            print(f"\n浏览器操作出错: {e}")
-            if self.debug:
-                import traceback
-                traceback.print_exc()
+            print(f"\n浏览器出错: {e}")
         finally:
-            # 确保关闭浏览器
-            if driver:
-                print("\n正在关闭浏览器...", flush=True)
-                try:
-                    driver.quit()
-                    print("driver.quit() 完成", flush=True)
-                except Exception as e:
-                    print(f"driver.quit() 出错: {e}", flush=True)
-                driver = None
-                print("浏览器已关闭", flush=True)
+            self._close_driver(driver)
 
-        print("init_tokens_via_browser 完成，返回:", success, flush=True)
-        return success
+        return False
 
     def refresh_tokens(self, bookId):
-        """刷新Token - 重新打开浏览器"""
-        print("\nToken可能已过期，需要重新获取...")
+        """刷新Token"""
+        print("\nToken可能已过期，正在刷新...", flush=True)
         self.session = requests.Session()
         self.session.headers.update({
             "Accept": "application/json, text/plain, */*",
@@ -180,6 +216,9 @@ class QidianScraper:
             "Connection": "keep-alive",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         })
+        self.csrf_token = None
+        self.w_tsfp = None
+        self.cookies = {}
         return self.init_tokens_via_browser(bookId)
 
     def _get_api_headers(self, referer):
@@ -318,12 +357,9 @@ def scrape_book_reviews(bookId, output_dir=None, debug=False):
     scraper = QidianScraper(debug=debug)
 
     # 通过浏览器初始化Token
-    print("准备初始化Token...", flush=True)
     if not scraper.init_tokens_via_browser(bookId):
         print("无法获取Token，退出")
         return []
-
-    print("Token初始化完成，继续执行...", flush=True)
 
     # 获取章节列表
     print(f"\n正在获取书籍 {bookId} 的章节列表...", flush=True)
