@@ -7,6 +7,7 @@
 示例: python qidian_book_reviews_scrape.py 1035420986
 """
 import os
+import re
 import sys
 import io
 import json
@@ -342,6 +343,93 @@ class QidianScraper:
 
         return comments
 
+    def get_chapter_content(self, bookId, chapterId):
+        """
+        获取章节内容，返回 {segmentId: 原文内容} 的字典
+        尝试多种方法获取
+        """
+        segment_content = {}
+
+        # 方法1: 尝试使用API获取章节内容
+        try:
+            url = "https://www.qidian.com/ajax/chapter/chapterInfo"
+            params = {"bookId": bookId, "chapterId": chapterId}
+            headers = self._get_api_headers(f"https://www.qidian.com/chapter/{bookId}/{chapterId}/")
+
+            if self.csrf_token:
+                params['_csrfToken'] = self.csrf_token
+            if self.w_tsfp:
+                params['w_tsfp'] = self.w_tsfp
+
+            resp = self.session.get(url, params=params, headers=headers, timeout=15)
+            resp.encoding = 'utf-8'
+
+            if resp.status_code == 200 and resp.text:
+                data = json.loads(resp.text)
+                if data.get('code') == 0 and data.get('data'):
+                    # 尝试从API响应中提取内容
+                    chapter_data = data['data']
+                    if 'content' in chapter_data:
+                        content = chapter_data['content']
+                        # 解析内容中的段落
+                        pattern = r'<p[^>]*data-segid=["\']?(-?\d+)["\']?[^>]*>(.*?)</p>'
+                        matches = re.findall(pattern, content, re.DOTALL)
+                        for seg_id, text in matches:
+                            clean_text = re.sub(r'<[^>]+>', '', text).strip()
+                            if clean_text:
+                                segment_content[seg_id] = clean_text
+
+                    if not segment_content and 'contents' in chapter_data:
+                        # 另一种格式: contents数组
+                        for item in chapter_data['contents']:
+                            if isinstance(item, dict):
+                                seg_id = str(item.get('segmentId', item.get('id', '')))
+                                text = item.get('content', item.get('text', ''))
+                                if seg_id and text:
+                                    clean_text = re.sub(r'<[^>]+>', '', text).strip()
+                                    segment_content[seg_id] = clean_text
+        except Exception as e:
+            self._debug_print(f"API获取章节内容失败: {e}")
+
+        # 方法2: 如果API失败，尝试用Selenium
+        if not segment_content and SELENIUM_AVAILABLE:
+            driver = None
+            try:
+                driver = self._create_driver(headless=True)
+                url = f"https://www.qidian.com/chapter/{bookId}/{chapterId}/"
+                driver.get(url)
+                time.sleep(3)
+
+                # 尝试从页面提取
+                from selenium.webdriver.common.by import By
+                selectors = [
+                    "div.read-content p[data-segid]",
+                    "div.main-text-wrap p[data-segid]",
+                    "p[data-segid]",
+                    "div.read-content p",
+                    "main p"
+                ]
+                for selector in selectors:
+                    try:
+                        paragraphs = driver.find_elements(By.CSS_SELECTOR, selector)
+                        if paragraphs:
+                            for idx, p in enumerate(paragraphs):
+                                seg_id = p.get_attribute('data-segid') or str(idx + 1)
+                                text = p.text.strip()
+                                if text and len(text) > 1:
+                                    segment_content[seg_id] = text
+                            if segment_content:
+                                break
+                    except:
+                        continue
+            except Exception as e:
+                self._debug_print(f"Selenium获取章节内容失败: {e}")
+            finally:
+                self._close_driver(driver)
+
+        self._debug_print(f"获取到 {len(segment_content)} 个段落内容")
+        return segment_content
+
 
 def scrape_book_reviews(bookId, output_dir=None, debug=False):
     """抓取整本书的所有画线评"""
@@ -417,6 +505,14 @@ def scrape_book_reviews(bookId, output_dir=None, debug=False):
 
             print(f"  发现 {len(summary_df)} 个有评论的段落")
 
+            # 获取章节内容（原文）
+            print(f"  正在获取章节原文...")
+            segment_contents = scraper.get_chapter_content(bookId, chapterId)
+            if segment_contents:
+                print(f"  获取到 {len(segment_contents)} 个段落原文")
+            else:
+                print(f"  未能获取段落原文")
+
             # 获取评论数字段名
             amount_col = None
             for col in ['reviewAmount', 'amount', 'count']:
@@ -429,15 +525,21 @@ def scrape_book_reviews(bookId, output_dir=None, debug=False):
             for j, (_, segment) in enumerate(summary_df.iterrows()):
                 segmentId = str(segment['segmentId'])
                 reviewAmount = segment.get(amount_col, '?') if amount_col else '?'
+                # 获取对应的原文
+                original_text = segment_contents.get(segmentId, '')
 
                 # 获取段落评论
                 comments = scraper.get_segment_comments(bookId, chapterId, segmentId, referer)
 
-                print(f"    段落 {segmentId}: 获取到 {len(comments)} 条评论")
+                if original_text:
+                    print(f"    段落 {segmentId}: 获取到 {len(comments)} 条评论 | 原文: {original_text[:30]}...")
+                else:
+                    print(f"    段落 {segmentId}: 获取到 {len(comments)} 条评论")
 
                 for comment in comments:
                     comment['chapterId'] = chapterId
                     comment['chapterName'] = chapterName
+                    comment['originalText'] = original_text  # 添加原文
                     chapter_reviews.append(comment)
 
                 time.sleep(0.3)
