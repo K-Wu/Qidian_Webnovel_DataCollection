@@ -8,12 +8,18 @@
 """
 import os
 import sys
+import io
 import json
 import time
 import requests
 import numpy as np
 import pandas as pd
 from requests.exceptions import ConnectionError
+
+# 修复Windows控制台编码问题
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 try:
     from selenium import webdriver
@@ -68,15 +74,18 @@ class QidianScraper:
         print("=" * 50)
 
         driver = None
+        success = False
         try:
             # 配置Chrome选项
             chrome_options = Options()
-            # 不使用无头模式，让用户可以看到并操作
             chrome_options.add_argument("--disable-blink-features=AutomationControlled")
             chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
             chrome_options.add_experimental_option('useAutomationExtension', False)
             chrome_options.add_argument("--disable-infobars")
             chrome_options.add_argument("--start-maximized")
+            # 禁用日志输出
+            chrome_options.add_argument("--log-level=3")
+            chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
             # 启动浏览器
             driver = webdriver.Chrome(options=chrome_options)
@@ -97,49 +106,49 @@ class QidianScraper:
 
             # 等待页面加载，检测是否成功获取到_csrfToken
             print("等待页面加载和Cookie生成...")
-            max_wait = 120  # 最多等待120秒
+            max_wait = 120
             start_time = time.time()
 
             while time.time() - start_time < max_wait:
-                # 获取当前cookies
-                selenium_cookies = driver.get_cookies()
-                cookie_dict = {c['name']: c['value'] for c in selenium_cookies}
-
-                self._debug_print(f"当前cookies: {list(cookie_dict.keys())}")
-
-                # 检查是否有_csrfToken
-                if '_csrfToken' in cookie_dict:
-                    self.csrf_token = cookie_dict['_csrfToken']
-                    self.w_tsfp = cookie_dict.get('w_tsfp', '')
-                    self.cookies = cookie_dict
-
-                    # 将cookies设置到requests session
-                    for name, value in cookie_dict.items():
-                        self.session.cookies.set(name, value)
-
-                    print(f"\n成功获取Token!")
-                    print(f"  _csrfToken: {self.csrf_token[:20]}...")
-                    if self.w_tsfp:
-                        print(f"  w_tsfp: {self.w_tsfp[:30]}...")
-
-                    # 关闭浏览器
-                    driver.quit()
-                    return True
-
-                # 检查页面标题，判断是否还在验证码页面
                 try:
+                    # 获取当前cookies
+                    selenium_cookies = driver.get_cookies()
+                    cookie_dict = {c['name']: c['value'] for c in selenium_cookies}
+
+                    self._debug_print(f"当前cookies: {list(cookie_dict.keys())}")
+
+                    # 检查是否有_csrfToken
+                    if '_csrfToken' in cookie_dict:
+                        self.csrf_token = cookie_dict['_csrfToken']
+                        self.w_tsfp = cookie_dict.get('w_tsfp', '')
+                        self.cookies = cookie_dict
+
+                        # 将cookies设置到requests session
+                        for name, value in cookie_dict.items():
+                            self.session.cookies.set(name, value)
+
+                        print(f"\n成功获取Token!")
+                        print(f"  _csrfToken: {self.csrf_token[:20]}...")
+                        if self.w_tsfp:
+                            print(f"  w_tsfp: {self.w_tsfp[:30]}...")
+
+                        success = True
+                        break
+
+                    # 检查页面标题
                     title = driver.title
                     if "验证" in title or "安全" in title:
-                        print(f"\r检测到验证页面，请完成验证... (已等待 {int(time.time() - start_time)}秒)", end="")
+                        print(f"\r检测到验证页面，请完成验证... (已等待 {int(time.time() - start_time)}秒)", end="", flush=True)
                     else:
-                        print(f"\r等待Cookie生成... (已等待 {int(time.time() - start_time)}秒)", end="")
-                except:
-                    pass
+                        print(f"\r等待Cookie生成... (已等待 {int(time.time() - start_time)}秒)", end="", flush=True)
+                except Exception as e:
+                    self._debug_print(f"检查cookie时出错: {e}")
 
                 time.sleep(2)
 
-            print("\n\n超时：未能在规定时间内获取到Cookie")
-            print("请确保页面已正常加载，并刷新重试")
+            if not success:
+                print("\n\n超时：未能在规定时间内获取到Cookie")
+                print("请确保页面已正常加载，并刷新重试")
 
         except Exception as e:
             print(f"\n浏览器操作出错: {e}")
@@ -147,13 +156,19 @@ class QidianScraper:
                 import traceback
                 traceback.print_exc()
         finally:
+            # 确保关闭浏览器
             if driver:
+                print("\n正在关闭浏览器...", flush=True)
                 try:
                     driver.quit()
-                except:
-                    pass
+                    print("driver.quit() 完成", flush=True)
+                except Exception as e:
+                    print(f"driver.quit() 出错: {e}", flush=True)
+                driver = None
+                print("浏览器已关闭", flush=True)
 
-        return False
+        print("init_tokens_via_browser 完成，返回:", success, flush=True)
+        return success
 
     def refresh_tokens(self, bookId):
         """刷新Token - 重新打开浏览器"""
@@ -188,6 +203,7 @@ class QidianScraper:
 
         try:
             resp = self.session.get(url, params=params, headers=headers, timeout=15)
+            resp.encoding = 'utf-8'  # 强制使用UTF-8编码
 
             self._debug_print(f"响应状态: {resp.status_code}, 长度: {len(resp.text)}")
 
@@ -293,18 +309,24 @@ def scrape_book_reviews(bookId, output_dir=None, debug=False):
     if output_dir is None:
         output_dir = "data/qidianBookReviews"
 
-    os.makedirs(output_dir, exist_ok=True)
+    # 创建书籍目录和章节子目录
+    book_dir = os.path.join(output_dir, bookId)
+    chapters_dir = os.path.join(book_dir, "chapters")
+    os.makedirs(chapters_dir, exist_ok=True)
 
     # 创建爬虫实例
     scraper = QidianScraper(debug=debug)
 
     # 通过浏览器初始化Token
+    print("准备初始化Token...", flush=True)
     if not scraper.init_tokens_via_browser(bookId):
         print("无法获取Token，退出")
         return []
 
+    print("Token初始化完成，继续执行...", flush=True)
+
     # 获取章节列表
-    print(f"\n正在获取书籍 {bookId} 的章节列表...")
+    print(f"\n正在获取书籍 {bookId} 的章节列表...", flush=True)
     chapters = scraper.get_all_chapters(bookId)
 
     if not chapters:
@@ -321,12 +343,27 @@ def scrape_book_reviews(bookId, output_dir=None, debug=False):
         print("没有免费章节，尝试使用所有章节...")
         free_chapters = chapters
 
+    # 检查已完成的章节（支持断点续传）
+    completed_chapters = set()
+    for f in os.listdir(chapters_dir):
+        if f.endswith('.csv'):
+            completed_chapters.add(f.replace('.csv', ''))
+
+    if completed_chapters:
+        print(f"发现 {len(completed_chapters)} 个已完成的章节，将跳过")
+
     referers = ['https://www.google.com', 'https://www.qidian.com', 'https://www.bing.com']
-    all_reviews = []
+    total_reviews = 0
 
     for i, chapter in enumerate(free_chapters):
-        chapterId = chapter['chapterId']
+        chapterId = str(chapter['chapterId'])
         chapterName = chapter['chapterName']
+
+        # 跳过已完成的章节
+        if chapterId in completed_chapters:
+            print(f"\n[{i+1}/{len(free_chapters)}] 跳过已完成章节: {chapterName} (ID: {chapterId})")
+            continue
+
         print(f"\n[{i+1}/{len(free_chapters)}] 处理章节: {chapterName} (ID: {chapterId})")
 
         try:
@@ -337,6 +374,9 @@ def scrape_book_reviews(bookId, output_dir=None, debug=False):
 
             if summary_df.empty:
                 print(f"  该章节没有画线评")
+                # 创建空文件标记已处理
+                empty_df = pd.DataFrame()
+                empty_df.to_csv(os.path.join(chapters_dir, f"{chapterId}.csv"), index=False, encoding='utf-8-sig')
                 continue
 
             print(f"  发现 {len(summary_df)} 个有评论的段落")
@@ -347,6 +387,8 @@ def scrape_book_reviews(bookId, output_dir=None, debug=False):
                 if col in summary_df.columns:
                     amount_col = col
                     break
+
+            chapter_reviews = []
 
             for j, (_, segment) in enumerate(summary_df.iterrows()):
                 segmentId = str(segment['segmentId'])
@@ -360,9 +402,21 @@ def scrape_book_reviews(bookId, output_dir=None, debug=False):
                 for comment in comments:
                     comment['chapterId'] = chapterId
                     comment['chapterName'] = chapterName
-                    all_reviews.append(comment)
+                    chapter_reviews.append(comment)
 
                 time.sleep(0.3)
+
+            # 保存章节文件
+            if chapter_reviews:
+                chapter_df = pd.DataFrame(chapter_reviews)
+                chapter_file = os.path.join(chapters_dir, f"{chapterId}.csv")
+                chapter_df.to_csv(chapter_file, index=False, encoding='utf-8-sig')
+                print(f"  已保存章节文件: {chapter_file} ({len(chapter_reviews)} 条评论)")
+                total_reviews += len(chapter_reviews)
+            else:
+                # 创建空文件标记已处理
+                empty_df = pd.DataFrame()
+                empty_df.to_csv(os.path.join(chapters_dir, f"{chapterId}.csv"), index=False, encoding='utf-8-sig')
 
             time.sleep(0.5)
 
@@ -377,17 +431,31 @@ def scrape_book_reviews(bookId, output_dir=None, debug=False):
                 traceback.print_exc()
             continue
 
-    # 保存结果
+    # 合并所有章节文件为总文件
+    print(f"\n正在合并所有章节文件...")
+    all_reviews = []
+    chapter_files = [f for f in os.listdir(chapters_dir) if f.endswith('.csv')]
+
+    for chapter_file in chapter_files:
+        file_path = os.path.join(chapters_dir, chapter_file)
+        try:
+            df = pd.read_csv(file_path, encoding='utf-8-sig')
+            if not df.empty:
+                all_reviews.append(df)
+        except Exception as e:
+            print(f"  读取 {chapter_file} 出错: {e}")
+
     if all_reviews:
-        df = pd.DataFrame(all_reviews)
-        output_file = os.path.join(output_dir, f"{bookId}.csv")
-        df.to_csv(output_file, index=False, encoding='utf-8-sig')
-        print(f"\n抓取完成！共获取 {len(all_reviews)} 条画线评")
-        print(f"数据已保存到: {output_file}")
+        merged_df = pd.concat(all_reviews, ignore_index=True)
+        output_file = os.path.join(book_dir, f"{bookId}_all.csv")
+        merged_df.to_csv(output_file, index=False, encoding='utf-8-sig')
+        print(f"\n抓取完成！共获取 {len(merged_df)} 条画线评")
+        print(f"章节文件保存在: {chapters_dir}")
+        print(f"汇总文件保存到: {output_file}")
+        return merged_df.to_dict('records')
     else:
         print("\n未找到任何画线评")
-
-    return all_reviews
+        return []
 
 
 if __name__ == "__main__":
