@@ -1,0 +1,23 @@
+code/qidian_book_reviews_scrape.py，复用了现有模块：
+
+导入的函数：
+- qidian_review_scrape.get_chapterCommentSummary() - 获取章节评论摘要
+- qidian_review_scrape.get_segmentComments() - 获取段落评论列表
+
+使用方法：
+
+cd code
+python qidian_book_reviews_scrape.py 1035420986
+
+脚本流程：
+1. 调用API获取所有章节ID
+2. 遍历每个免费章节，调用 get_chapterCommentSummary() 获取有评论的段落
+3. 对每个段落调用 get_segmentComments() 获取画线评
+4. 保存到 data/qidianBookReviews/1035420986.csv
+
+在这个过程中会间或地需要重新刷新CSRF_TOKEN, W_TSFP, COOKIE等变量，具体流程如下：
+1. 脚本启动Chrome浏览器
+2. 自动访问书籍页面
+3. 如果出现验证码，请手动完成
+4. 页面加载完成后，脚本自动获取Cookie并关闭浏览器
+5. 继续使用获取的Cookie抓取数据
